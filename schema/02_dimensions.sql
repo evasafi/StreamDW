@@ -6,21 +6,24 @@
 -- Follows star schema design (Kimball methodology).
 --
 -- SQL Skills Demonstrated:
---   - CTEs (WITH clauses)
+--   - Recursive CTE for calendar generation
+--   - CTEs (WITH clauses) for multi-step pipelines
 --   - CASE expressions for data bucketing
 --   - Window functions (ROW_NUMBER for deduplication)
 --   - Date/time functions
---   - Recursive CTE for calendar generation
 --   - JOINs for enrichment
 --   - Data cleaning patterns (NULL handling, validation)
 -- ============================================================
 
 USE stream_dw;
 
+-- Required for recursive CTE to generate 2922 days
+SET @@cte_max_recursion_depth = 5000;
+
 
 -- ============================================================
 -- 1. DIM_DATE — Calendar Dimension
--- 
+--
 -- Pre-generated calendar table spanning 2020-2027.
 -- Eliminates repeated EXTRACT() and DATE_FORMAT() calls
 -- in analytical queries.
@@ -41,23 +44,19 @@ CREATE TABLE dim_date (
     month_number    TINYINT         NOT NULL,
     month_name      VARCHAR(10)     NOT NULL,
     quarter         TINYINT         NOT NULL,
-    year            SMALLINT        NOT NULL,
+    yr              SMALLINT        NOT NULL,
     is_weekend      BOOLEAN         NOT NULL,
     is_month_start  BOOLEAN         NOT NULL,
     is_month_end    BOOLEAN         NOT NULL,
-    year_month      VARCHAR(7)      NOT NULL    COMMENT 'YYYY-MM for easy grouping',
+    ym_label        VARCHAR(7)      NOT NULL    COMMENT 'YYYY-MM for easy grouping',
 
     PRIMARY KEY (date_key),
     UNIQUE INDEX idx_dim_date_full (full_date),
-    INDEX idx_dim_date_year_month (year, month_number),
-    INDEX idx_dim_date_ym (year_month)
+    INDEX idx_dim_date_year_month (yr, month_number),
+    INDEX idx_dim_date_ym (ym_label)
 ) ENGINE=InnoDB
   COMMENT='Calendar dimension table. One row per day, 2020-2027.';
 
--- Allow the recursive CTE to process all 2922 days
-SET @@cte_max_recursion_depth = 5000;
-
--- Populate using recursive CTE
 INSERT INTO dim_date
 WITH RECURSIVE date_series AS (
     -- Anchor: start date
@@ -69,24 +68,22 @@ WITH RECURSIVE date_series AS (
     WHERE d < '2027-12-31'
 )
 SELECT
-    -- Surrogate key: YYYYMMDD as integer
-    CAST(DATE_FORMAT(d, '%Y%m%d') AS UNSIGNED)          AS date_key,
-    d                                                     AS full_date,
-    DAYOFWEEK(d)                                          AS day_of_week,
-    DAYNAME(d)                                            AS day_name,
-    DAY(d)                                                AS day_of_month,
-    DAYOFYEAR(d)                                          AS day_of_year,
-    WEEK(d, 1)                                            AS week_of_year,
-    MONTH(d)                                              AS month_number,
-    MONTHNAME(d)                                          AS month_name,
-    QUARTER(d)                                            AS quarter,
-    YEAR(d)                                               AS year,
-    CASE WHEN DAYOFWEEK(d) IN (1, 7) THEN TRUE ELSE FALSE END AS is_weekend,
-    CASE WHEN DAY(d) = 1 THEN TRUE ELSE FALSE END        AS is_month_start,
-    CASE WHEN d = LAST_DAY(d) THEN TRUE ELSE FALSE END   AS is_month_end,
-    DATE_FORMAT(d, '%Y-%m')                               AS year_month
+    CAST(DATE_FORMAT(d, '%Y%m%d') AS UNSIGNED)                    AS date_key,
+    d                                                              AS full_date,
+    DAYOFWEEK(d)                                                   AS day_of_week,
+    DAYNAME(d)                                                     AS day_name,
+    DAY(d)                                                         AS day_of_month,
+    DAYOFYEAR(d)                                                   AS day_of_year,
+    WEEK(d, 1)                                                     AS week_of_year,
+    MONTH(d)                                                       AS month_number,
+    MONTHNAME(d)                                                   AS month_name,
+    QUARTER(d)                                                     AS quarter,
+    YEAR(d)                                                        AS yr,
+    CASE WHEN DAYOFWEEK(d) IN (1, 7) THEN TRUE ELSE FALSE END     AS is_weekend,
+    CASE WHEN DAY(d) = 1 THEN TRUE ELSE FALSE END                 AS is_month_start,
+    CASE WHEN d = LAST_DAY(d) THEN TRUE ELSE FALSE END            AS is_month_end,
+    DATE_FORMAT(d, '%Y-%m')                                        AS ym_label
 FROM date_series;
-
 
 
 -- ============================================================
@@ -154,8 +151,6 @@ CREATE TABLE dim_users (
 ) ENGINE=InnoDB
   COMMENT='Cleaned user dimension. Deduplicated, validated, enriched.';
 
-
--- Populate with CTE pipeline
 INSERT INTO dim_users (
     user_id, email, username, country, signup_date, signup_date_key,
     birth_year, age_group, region, days_since_signup,
@@ -165,15 +160,9 @@ WITH
 -- Step 1: Deduplicate by email, keeping the earliest signup
 deduplicated_users AS (
     SELECT
-        user_id,
-        email,
-        username,
-        country,
-        signup_date,
-        birth_year,
+        user_id, email, username, country, signup_date, birth_year,
         ROW_NUMBER() OVER (
-            PARTITION BY email
-            ORDER BY signup_date ASC
+            PARTITION BY email ORDER BY signup_date ASC
         ) AS rn
     FROM raw_users
 ),
@@ -181,12 +170,9 @@ deduplicated_users AS (
 -- Step 2: Get each user's latest subscription
 latest_subscriptions AS (
     SELECT
-        user_id,
-        plan_type,
-        status,
+        user_id, plan_type, status,
         ROW_NUMBER() OVER (
-            PARTITION BY user_id
-            ORDER BY start_date DESC, subscription_id DESC
+            PARTITION BY user_id ORDER BY start_date DESC, subscription_id DESC
         ) AS rn
     FROM raw_subscriptions
 ),
@@ -198,7 +184,7 @@ cleaned_users AS (
         du.email,
         du.username,
         du.country,
-        DATE(du.signup_date)    AS signup_date,
+        DATE(du.signup_date) AS signup_date,
 
         -- Clean birth_year: NULL if outside reasonable range
         CASE
@@ -206,7 +192,7 @@ cleaned_users AS (
             ELSE NULL
         END AS clean_birth_year,
 
-        -- Derive age group from cleaned birth_year
+        -- Derive age group
         CASE
             WHEN du.birth_year BETWEEN 1930 AND 1964 THEN '60+'
             WHEN du.birth_year BETWEEN 1965 AND 1980 THEN '45-59'
@@ -228,32 +214,21 @@ cleaned_users AS (
             ELSE 'Other'
         END AS region,
 
-        -- Days since signup (relative to now)
         DATEDIFF(CURDATE(), DATE(du.signup_date)) AS days_since_signup,
-
-        -- Latest subscription info
         ls.plan_type    AS current_plan_type,
         ls.status       AS current_plan_status
 
     FROM deduplicated_users du
     LEFT JOIN latest_subscriptions ls
         ON du.user_id = ls.user_id AND ls.rn = 1
-    WHERE du.rn = 1   -- keep only first occurrence per email
+    WHERE du.rn = 1
 )
 
 SELECT
-    cu.user_id,
-    cu.email,
-    cu.username,
-    cu.country,
-    cu.signup_date,
+    cu.user_id, cu.email, cu.username, cu.country, cu.signup_date,
     CAST(DATE_FORMAT(cu.signup_date, '%Y%m%d') AS UNSIGNED) AS signup_date_key,
-    cu.clean_birth_year,
-    cu.age_group,
-    cu.region,
-    cu.days_since_signup,
-    cu.current_plan_type,
-    cu.current_plan_status
+    cu.clean_birth_year, cu.age_group, cu.region, cu.days_since_signup,
+    cu.current_plan_type, cu.current_plan_status
 FROM cleaned_users cu;
 
 
@@ -296,37 +271,22 @@ CREATE TABLE dim_content (
 ) ENGINE=InnoDB
   COMMENT='Enriched content dimension with derived categories.';
 
-
 INSERT INTO dim_content (
     content_id, title, content_type, genre, release_year, decade,
     duration_minutes, duration_bucket, rating, is_original,
     production_cost_usd, cost_tier
 )
 SELECT
-    content_id,
-    title,
-    content_type,
-    genre,
-    release_year,
-
-    -- Derive decade label
+    content_id, title, content_type, genre, release_year,
     CONCAT(FLOOR(release_year / 10) * 10, 's') AS decade,
-
     duration_minutes,
-
-    -- Categorize by duration
     CASE
         WHEN duration_minutes <= 15  THEN 'short'
         WHEN duration_minutes <= 45  THEN 'medium'
         WHEN duration_minutes <= 90  THEN 'long'
         ELSE 'feature'
     END AS duration_bucket,
-
-    rating,
-    is_original,
-    production_cost_usd,
-
-    -- Categorize by production cost
+    rating, is_original, production_cost_usd,
     CASE
         WHEN production_cost_usd IS NULL        THEN NULL
         WHEN production_cost_usd < 100000       THEN 'low'
@@ -334,7 +294,6 @@ SELECT
         WHEN production_cost_usd < 10000000     THEN 'high'
         ELSE 'premium'
     END AS cost_tier
-
 FROM raw_content;
 
 
@@ -344,38 +303,7 @@ FROM raw_content;
 
 SELECT '--- DIMENSION TABLES LOADED ---' AS status;
 
-SELECT 'dim_date' AS table_name, COUNT(*) AS row_count FROM dim_date
-UNION ALL
-SELECT 'dim_device', COUNT(*) FROM dim_device
-UNION ALL
-SELECT 'dim_users', COUNT(*) FROM dim_users
-UNION ALL
-SELECT 'dim_content', COUNT(*) FROM dim_content;
-
--- Quick data quality check
-SELECT '--- DATA QUALITY CHECKS ---' AS status;
-
--- Check age group distribution
-SELECT age_group, COUNT(*) AS user_count
-FROM dim_users
-GROUP BY age_group
-ORDER BY user_count DESC;
-
--- Check region distribution
-SELECT region, COUNT(*) AS user_count
-FROM dim_users
-GROUP BY region
-ORDER BY user_count DESC;
-
--- Check content distribution
-SELECT content_type, duration_bucket, COUNT(*) AS content_count
-FROM dim_content
-GROUP BY content_type, duration_bucket
-ORDER BY content_type, duration_bucket;
-
--- Check cost tier distribution
-SELECT cost_tier, COUNT(*) AS content_count
-FROM dim_content
-WHERE cost_tier IS NOT NULL
-GROUP BY cost_tier
-ORDER BY content_count DESC;
+SELECT 'dim_date' AS tbl, COUNT(*) AS cnt FROM dim_date
+UNION ALL SELECT 'dim_device', COUNT(*) FROM dim_device
+UNION ALL SELECT 'dim_users', COUNT(*) FROM dim_users
+UNION ALL SELECT 'dim_content', COUNT(*) FROM dim_content;

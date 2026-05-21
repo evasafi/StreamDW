@@ -3,17 +3,15 @@
 -- File: schema/04_reporting.sql
 --
 -- Pre-aggregated tables and views optimized for dashboards
--- and ad-hoc analysis. These sit on top of the fact and
--- dimension tables and answer common business questions
--- without requiring complex JOINs each time.
+-- and ad-hoc analysis.
 --
 -- SQL Skills Demonstrated:
 --   - Multi-CTE aggregation pipelines
 --   - Window functions (LAG, SUM OVER, running totals)
 --   - Conditional aggregation (CASE inside SUM/COUNT)
---   - GROUP BY with ROLLUP for subtotals
 --   - Views for reusable reporting logic
 --   - Subqueries for derived metrics
+--   - Temporary tables for complex multi-step ETL
 -- ============================================================
 
 USE stream_dw;
@@ -85,13 +83,8 @@ user_viewing_stats AS (
 user_top_device AS (
     SELECT user_id, device_type AS favorite_device
     FROM (
-        SELECT
-            user_id,
-            device_type,
-            ROW_NUMBER() OVER (
-                PARTITION BY user_id
-                ORDER BY COUNT(*) DESC
-            ) AS rn
+        SELECT user_id, device_type,
+            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC) AS rn
         FROM fact_viewing_events
         GROUP BY user_id, device_type
     ) ranked
@@ -102,13 +95,8 @@ user_top_device AS (
 user_top_genre AS (
     SELECT user_id, genre AS favorite_genre
     FROM (
-        SELECT
-            fve.user_id,
-            dc.genre,
-            ROW_NUMBER() OVER (
-                PARTITION BY fve.user_id
-                ORDER BY COUNT(*) DESC
-            ) AS rn
+        SELECT fve.user_id, dc.genre,
+            ROW_NUMBER() OVER (PARTITION BY fve.user_id ORDER BY COUNT(*) DESC) AS rn
         FROM fact_viewing_events fve
         INNER JOIN dim_content dc ON fve.content_id = dc.content_id
         GROUP BY fve.user_id, dc.genre
@@ -118,41 +106,31 @@ user_top_genre AS (
 
 -- Final assembly
 SELECT
-    du.user_id,
-    du.username,
-    du.region,
-    du.age_group,
-    du.current_plan_type                                        AS current_plan,
-    du.signup_date,
-    du.days_since_signup,
+    du.user_id, du.username, du.region, du.age_group,
+    du.current_plan_type AS current_plan,
+    du.signup_date, du.days_since_signup,
 
-    COALESCE(uvs.total_watch_events, 0)                         AS total_watch_events,
-    COALESCE(uvs.total_watch_minutes, 0)                        AS total_watch_minutes,
-    COALESCE(uvs.total_completed, 0)                            AS total_completed,
-    COALESCE(uvs.total_abandoned, 0)                            AS total_abandoned,
+    COALESCE(uvs.total_watch_events, 0),
+    COALESCE(uvs.total_watch_minutes, 0),
+    COALESCE(uvs.total_completed, 0),
+    COALESCE(uvs.total_abandoned, 0),
 
-    -- Completion rate: completed / (completed + abandoned) × 100
     CASE
         WHEN (COALESCE(uvs.total_completed, 0) + COALESCE(uvs.total_abandoned, 0)) > 0
-        THEN ROUND(
-            uvs.total_completed * 100.0 /
-            (uvs.total_completed + uvs.total_abandoned), 2
-        )
+        THEN ROUND(uvs.total_completed * 100.0 / (uvs.total_completed + uvs.total_abandoned), 2)
         ELSE NULL
-    END                                                         AS completion_rate,
+    END AS completion_rate,
 
-    COALESCE(uvs.distinct_content_watched, 0)                   AS distinct_content_watched,
-    COALESCE(uvs.distinct_days_active, 0)                       AS distinct_days_active,
-
+    COALESCE(uvs.distinct_content_watched, 0),
+    COALESCE(uvs.distinct_days_active, 0),
     utd.favorite_device,
     utg.favorite_genre,
 
-    -- Average daily watch time (only on days they were active)
     CASE
         WHEN COALESCE(uvs.distinct_days_active, 0) > 0
         THEN ROUND(uvs.total_watch_minutes / uvs.distinct_days_active, 2)
         ELSE NULL
-    END                                                         AS avg_daily_watch_min,
+    END AS avg_daily_watch_min,
 
     uvs.first_watch_date,
     uvs.last_watch_date,
@@ -161,16 +139,15 @@ SELECT
         WHEN uvs.last_watch_date IS NOT NULL
         THEN DATEDIFF(CURDATE(), uvs.last_watch_date)
         ELSE NULL
-    END                                                         AS days_since_last_watch,
+    END AS days_since_last_watch,
 
-    -- Churn risk segmentation
     CASE
-        WHEN uvs.last_watch_date IS NULL                        THEN 'new'
-        WHEN DATEDIFF(CURDATE(), uvs.last_watch_date) > 60      THEN 'churned'
-        WHEN DATEDIFF(CURDATE(), uvs.last_watch_date) > 30      THEN 'high'
-        WHEN DATEDIFF(CURDATE(), uvs.last_watch_date) > 14      THEN 'medium'
+        WHEN uvs.last_watch_date IS NULL                    THEN 'new'
+        WHEN DATEDIFF(CURDATE(), uvs.last_watch_date) > 60  THEN 'churned'
+        WHEN DATEDIFF(CURDATE(), uvs.last_watch_date) > 30  THEN 'high'
+        WHEN DATEDIFF(CURDATE(), uvs.last_watch_date) > 14  THEN 'medium'
         ELSE 'low'
-    END                                                         AS churn_risk
+    END AS churn_risk
 
 FROM dim_users du
 LEFT JOIN user_viewing_stats uvs   ON du.user_id = uvs.user_id
@@ -185,7 +162,7 @@ LEFT JOIN user_top_genre utg       ON du.user_id = utg.user_id;
 -- Used for: content investment decisions, catalog optimization.
 --
 -- Techniques: Conditional aggregation, computed ROI metrics,
---             percentile-style ranking with window functions
+--             RANK() window function
 -- ============================================================
 
 DROP TABLE IF EXISTS mart_content_performance;
@@ -223,81 +200,67 @@ CREATE TABLE mart_content_performance (
 
 INSERT INTO mart_content_performance
 SELECT
-    dc.content_id,
-    dc.title,
-    dc.content_type,
-    dc.genre,
-    dc.release_year,
-    dc.duration_minutes,
-    dc.duration_bucket,
-    dc.is_original,
-    dc.production_cost_usd,
-    dc.cost_tier,
+    dc.content_id, dc.title, dc.content_type, dc.genre, dc.release_year,
+    dc.duration_minutes, dc.duration_bucket, dc.is_original,
+    dc.production_cost_usd, dc.cost_tier,
 
-    COALESCE(stats.total_views, 0)          AS total_views,
-    COALESCE(stats.unique_viewers, 0)       AS unique_viewers,
-    COALESCE(stats.total_completions, 0)    AS total_completions,
-    COALESCE(stats.total_abandons, 0)       AS total_abandons,
+    COALESCE(s.total_views, 0),
+    COALESCE(s.unique_viewers, 0),
+    COALESCE(s.total_completions, 0),
+    COALESCE(s.total_abandons, 0),
 
-    -- Completion rate
     CASE
-        WHEN (COALESCE(stats.total_completions, 0) + COALESCE(stats.total_abandons, 0)) > 0
-        THEN ROUND(
-            stats.total_completions * 100.0 /
-            (stats.total_completions + stats.total_abandons), 2
-        )
+        WHEN (COALESCE(s.total_completions, 0) + COALESCE(s.total_abandons, 0)) > 0
+        THEN ROUND(s.total_completions * 100.0 / (s.total_completions + s.total_abandons), 2)
         ELSE NULL
-    END                                     AS completion_rate,
+    END AS completion_rate,
 
-    COALESCE(stats.total_watch_minutes, 0)  AS total_watch_minutes,
-    stats.avg_watch_minutes,
+    COALESCE(s.total_watch_minutes, 0),
+    s.avg_watch_minutes,
 
-    -- ROI: views per dollar invested
     CASE
         WHEN dc.production_cost_usd > 0
-        THEN ROUND(COALESCE(stats.total_views, 0) / dc.production_cost_usd, 6)
+        THEN ROUND(COALESCE(s.total_views, 0) / dc.production_cost_usd, 6)
         ELSE NULL
-    END                                     AS views_per_dollar,
+    END AS views_per_dollar,
 
-    -- ROI: minutes watched per dollar invested
     CASE
         WHEN dc.production_cost_usd > 0
-        THEN ROUND(COALESCE(stats.total_watch_minutes, 0) / dc.production_cost_usd, 6)
+        THEN ROUND(COALESCE(s.total_watch_minutes, 0) / dc.production_cost_usd, 6)
         ELSE NULL
-    END                                     AS minutes_per_dollar,
+    END AS minutes_per_dollar,
 
-    -- Popularity rank across entire catalog
-    RANK() OVER (ORDER BY COALESCE(stats.total_views, 0) DESC) AS popularity_rank
+    RANK() OVER (ORDER BY COALESCE(s.total_views, 0) DESC) AS popularity_rank
 
 FROM dim_content dc
 LEFT JOIN (
     SELECT
         content_id,
-        COUNT(*)                                AS total_views,
-        COUNT(DISTINCT user_id)                 AS unique_viewers,
-        SUM(is_completed)                       AS total_completions,
-        SUM(is_abandoned)                       AS total_abandons,
-        ROUND(SUM(watch_duration_minutes), 2)   AS total_watch_minutes,
-        ROUND(AVG(watch_duration_minutes), 2)   AS avg_watch_minutes
+        COUNT(*) AS total_views,
+        COUNT(DISTINCT user_id) AS unique_viewers,
+        SUM(is_completed) AS total_completions,
+        SUM(is_abandoned) AS total_abandons,
+        ROUND(SUM(watch_duration_minutes), 2) AS total_watch_minutes,
+        ROUND(AVG(watch_duration_minutes), 2) AS avg_watch_minutes
     FROM fact_viewing_events
     GROUP BY content_id
-) stats ON dc.content_id = stats.content_id;
+) s ON dc.content_id = s.content_id;
 
 
 -- ============================================================
 -- 3. MART_SUBSCRIPTION_METRICS
 --
 -- Monthly aggregation of subscription KPIs.
--- One row per month. Used for: MRR tracking, churn trends.
+-- One row per month. Uses temporary tables for clean multi-step ETL.
 --
--- Techniques: Date truncation, conditional COUNT/SUM,
---             window functions for month-over-month change
+-- Techniques: Temp tables, conditional COUNT/SUM,
+--             date range overlap logic for active subscriptions
 -- ============================================================
 
 DROP TABLE IF EXISTS mart_subscription_metrics;
 
 CREATE TABLE mart_subscription_metrics (
-    year_month              VARCHAR(7)      NOT NULL    COMMENT 'YYYY-MM',
+    ym                      VARCHAR(7)      NOT NULL    COMMENT 'YYYY-MM',
     new_subscriptions       INT             NOT NULL DEFAULT 0,
     ended_subscriptions     INT             NOT NULL DEFAULT 0,
     net_change              INT             NOT NULL DEFAULT 0,
@@ -306,99 +269,78 @@ CREATE TABLE mart_subscription_metrics (
     active_standard         INT             NOT NULL DEFAULT 0,
     active_premium          INT             NOT NULL DEFAULT 0,
     total_active            INT             NOT NULL DEFAULT 0,
-    monthly_revenue         DECIMAL(12,2)   NOT NULL DEFAULT 0  COMMENT 'Sum of monthly prices for active subs',
+    monthly_revenue         DECIMAL(12,2)   NOT NULL DEFAULT 0,
     avg_revenue_per_user    DECIMAL(8,2)    NULL        COMMENT 'ARPU for paying subscribers',
-    revenue_mom_change      DECIMAL(8,2)    NULL        COMMENT 'Month-over-month revenue change %',
-
-    PRIMARY KEY (year_month)
+    PRIMARY KEY (ym)
 ) ENGINE=InnoDB
   COMMENT='Monthly subscription KPI mart. One row per month.';
 
+-- Step-by-step with temp tables (avoids MySQL subquery limitations)
+DROP TEMPORARY TABLE IF EXISTS tmp_months;
+CREATE TEMPORARY TABLE tmp_months AS
+SELECT DISTINCT ym_label AS ym FROM dim_date
+WHERE full_date BETWEEN '2023-01-01' AND '2025-12-31';
+
+DROP TEMPORARY TABLE IF EXISTS tmp_new;
+CREATE TEMPORARY TABLE tmp_new AS
+SELECT DATE_FORMAT(start_date, '%Y-%m') AS ym, COUNT(*) AS cnt
+FROM fact_subscriptions
+GROUP BY DATE_FORMAT(start_date, '%Y-%m');
+
+DROP TEMPORARY TABLE IF EXISTS tmp_ended;
+CREATE TEMPORARY TABLE tmp_ended AS
+SELECT DATE_FORMAT(end_date, '%Y-%m') AS ym, COUNT(*) AS cnt
+FROM fact_subscriptions
+WHERE end_date IS NOT NULL
+GROUP BY DATE_FORMAT(end_date, '%Y-%m');
+
+DROP TEMPORARY TABLE IF EXISTS tmp_active;
+CREATE TEMPORARY TABLE tmp_active AS
+SELECT
+    m.ym,
+    SUM(CASE WHEN fs.plan_type = 'free_trial' THEN 1 ELSE 0 END) AS ft,
+    SUM(CASE WHEN fs.plan_type = 'basic'      THEN 1 ELSE 0 END) AS ba,
+    SUM(CASE WHEN fs.plan_type = 'standard'   THEN 1 ELSE 0 END) AS st,
+    SUM(CASE WHEN fs.plan_type = 'premium'    THEN 1 ELSE 0 END) AS pr,
+    COUNT(*) AS total_active,
+    SUM(fs.monthly_price) AS revenue
+FROM tmp_months m
+INNER JOIN fact_subscriptions fs
+    ON fs.start_date <= LAST_DAY(CONCAT(m.ym, '-01'))
+    AND (fs.end_date >= CONCAT(m.ym, '-01') OR fs.end_date IS NULL)
+GROUP BY m.ym;
 
 INSERT INTO mart_subscription_metrics
-WITH
--- Generate a list of all months in our data range
-month_series AS (
-    SELECT DISTINCT year_month
-    FROM dim_date
-    WHERE full_date BETWEEN '2023-01-01' AND '2025-12-31'
-),
-
--- Count new subscriptions per month
-new_subs AS (
-    SELECT
-        DATE_FORMAT(start_date, '%Y-%m') AS year_month,
-        COUNT(*) AS new_count
-    FROM fact_subscriptions
-    GROUP BY DATE_FORMAT(start_date, '%Y-%m')
-),
-
--- Count ended subscriptions per month
-ended_subs AS (
-    SELECT
-        DATE_FORMAT(end_date, '%Y-%m') AS year_month,
-        COUNT(*) AS ended_count
-    FROM fact_subscriptions
-    WHERE end_date IS NOT NULL
-    GROUP BY DATE_FORMAT(end_date, '%Y-%m')
-),
-
--- For each month, count active subscriptions by plan type
--- A subscription is active in a month if start_date <= month_end AND (end_date >= month_start OR end_date IS NULL)
-monthly_active AS (
-    SELECT
-        ms.year_month,
-        SUM(CASE WHEN fs.plan_type = 'free_trial' THEN 1 ELSE 0 END) AS active_free_trial,
-        SUM(CASE WHEN fs.plan_type = 'basic'      THEN 1 ELSE 0 END) AS active_basic,
-        SUM(CASE WHEN fs.plan_type = 'standard'   THEN 1 ELSE 0 END) AS active_standard,
-        SUM(CASE WHEN fs.plan_type = 'premium'    THEN 1 ELSE 0 END) AS active_premium,
-        COUNT(*)                                                       AS total_active,
-        SUM(fs.monthly_price)                                          AS monthly_revenue
-    FROM month_series ms
-    CROSS JOIN fact_subscriptions fs
-    WHERE fs.start_date <= LAST_DAY(CONCAT(ms.year_month, '-01'))
-      AND (fs.end_date >= CONCAT(ms.year_month, '-01') OR fs.end_date IS NULL)
-    GROUP BY ms.year_month
-)
-
 SELECT
-    ma.year_month,
-    COALESCE(ns.new_count, 0)                                   AS new_subscriptions,
-    COALESCE(es.ended_count, 0)                                 AS ended_subscriptions,
-    COALESCE(ns.new_count, 0) - COALESCE(es.ended_count, 0)    AS net_change,
-    ma.active_free_trial,
-    ma.active_basic,
-    ma.active_standard,
-    ma.active_premium,
-    ma.total_active,
-    ROUND(ma.monthly_revenue, 2)                                AS monthly_revenue,
-
-    -- ARPU: revenue / paying subscribers (exclude free trial)
+    m.ym,
+    COALESCE(n.cnt, 0),
+    COALESCE(e.cnt, 0),
+    COALESCE(n.cnt, 0) - COALESCE(e.cnt, 0),
+    COALESCE(a.ft, 0),
+    COALESCE(a.ba, 0),
+    COALESCE(a.st, 0),
+    COALESCE(a.pr, 0),
+    COALESCE(a.total_active, 0),
+    ROUND(COALESCE(a.revenue, 0), 2),
     CASE
-        WHEN (ma.total_active - ma.active_free_trial) > 0
-        THEN ROUND(
-            ma.monthly_revenue / (ma.total_active - ma.active_free_trial), 2
-        )
+        WHEN (COALESCE(a.total_active, 0) - COALESCE(a.ft, 0)) > 0
+        THEN ROUND(COALESCE(a.revenue, 0) / (a.total_active - a.ft), 2)
         ELSE NULL
-    END                                                         AS avg_revenue_per_user,
+    END
+FROM tmp_months m
+LEFT JOIN tmp_new n     ON m.ym = n.ym
+LEFT JOIN tmp_ended e   ON m.ym = e.ym
+LEFT JOIN tmp_active a  ON m.ym = a.ym
+ORDER BY m.ym;
 
-    -- Month-over-month revenue change (uses LAG window function)
-    ROUND(
-        (ma.monthly_revenue - LAG(ma.monthly_revenue) OVER (ORDER BY ma.year_month))
-        / NULLIF(LAG(ma.monthly_revenue) OVER (ORDER BY ma.year_month), 0) * 100
-    , 2)                                                        AS revenue_mom_change
-
-FROM monthly_active ma
-LEFT JOIN new_subs ns   ON ma.year_month = ns.year_month
-LEFT JOIN ended_subs es ON ma.year_month = es.year_month
-ORDER BY ma.year_month;
+DROP TEMPORARY TABLE IF EXISTS tmp_months;
+DROP TEMPORARY TABLE IF EXISTS tmp_new;
+DROP TEMPORARY TABLE IF EXISTS tmp_ended;
+DROP TEMPORARY TABLE IF EXISTS tmp_active;
 
 
 -- ============================================================
 -- 4. REUSABLE VIEWS
---
--- Views encapsulate common query patterns so analysts
--- don't have to write complex JOINs each time.
 -- ============================================================
 
 -- View: Daily Active Users (DAU) time series
@@ -408,36 +350,27 @@ CREATE VIEW v_daily_active_users AS
 SELECT
     dd.full_date,
     dd.day_name,
-    dd.year_month,
+    dd.ym_label,
     dd.is_weekend,
     COUNT(DISTINCT fve.user_id) AS daily_active_users,
     SUM(fve.watch_duration_minutes) AS total_watch_minutes,
     COUNT(*) AS total_events
 FROM dim_date dd
-LEFT JOIN fact_viewing_events fve
-    ON dd.date_key = fve.date_key
+LEFT JOIN fact_viewing_events fve ON dd.date_key = fve.date_key
 WHERE dd.full_date BETWEEN '2023-01-01' AND '2025-12-31'
-GROUP BY dd.full_date, dd.day_name, dd.year_month, dd.is_weekend;
+GROUP BY dd.full_date, dd.day_name, dd.ym_label, dd.is_weekend;
 
 
--- View: Content leaderboard (top content by views)
+-- View: Content leaderboard
 DROP VIEW IF EXISTS v_content_leaderboard;
 
 CREATE VIEW v_content_leaderboard AS
 SELECT
-    mcp.popularity_rank,
-    mcp.title,
-    mcp.content_type,
-    mcp.genre,
-    mcp.is_original,
-    mcp.total_views,
-    mcp.unique_viewers,
-    mcp.completion_rate,
-    mcp.total_watch_minutes,
-    mcp.views_per_dollar,
-    mcp.cost_tier
-FROM mart_content_performance mcp
-ORDER BY mcp.popularity_rank;
+    popularity_rank, title, content_type, genre, is_original,
+    total_views, unique_viewers, completion_rate,
+    total_watch_minutes, views_per_dollar, cost_tier
+FROM mart_content_performance
+ORDER BY popularity_rank;
 
 
 -- View: Churn risk summary
@@ -445,9 +378,7 @@ DROP VIEW IF EXISTS v_churn_risk_summary;
 
 CREATE VIEW v_churn_risk_summary AS
 SELECT
-    churn_risk,
-    current_plan,
-    region,
+    churn_risk, current_plan, region,
     COUNT(*) AS user_count,
     ROUND(AVG(total_watch_minutes), 1) AS avg_watch_minutes,
     ROUND(AVG(distinct_days_active), 1) AS avg_days_active,
@@ -462,29 +393,12 @@ GROUP BY churn_risk, current_plan, region;
 
 SELECT '--- REPORTING LAYER LOADED ---' AS status;
 
-SELECT 'mart_user_engagement' AS table_name, COUNT(*) AS row_count FROM mart_user_engagement
-UNION ALL
-SELECT 'mart_content_performance', COUNT(*) FROM mart_content_performance
-UNION ALL
-SELECT 'mart_subscription_metrics', COUNT(*) FROM mart_subscription_metrics;
+SELECT 'mart_user_engagement' AS tbl, COUNT(*) AS cnt FROM mart_user_engagement
+UNION ALL SELECT 'mart_content_performance', COUNT(*) FROM mart_content_performance
+UNION ALL SELECT 'mart_subscription_metrics', COUNT(*) FROM mart_subscription_metrics;
 
--- Churn risk distribution
-SELECT '--- CHURN RISK DISTRIBUTION ---' AS status;
-SELECT churn_risk, COUNT(*) AS users,
-       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
-FROM mart_user_engagement
-GROUP BY churn_risk
-ORDER BY users DESC;
+SELECT churn_risk, COUNT(*) AS users FROM mart_user_engagement GROUP BY churn_risk ORDER BY users DESC;
 
--- Top 5 content by views
-SELECT '--- TOP 5 CONTENT ---' AS status;
-SELECT popularity_rank, title, content_type, total_views, completion_rate
-FROM v_content_leaderboard
-LIMIT 5;
+SELECT popularity_rank, title, total_views FROM mart_content_performance ORDER BY popularity_rank LIMIT 5;
 
--- Latest 3 months of subscription metrics
-SELECT '--- RECENT SUBSCRIPTION TRENDS ---' AS status;
-SELECT year_month, total_active, monthly_revenue, revenue_mom_change
-FROM mart_subscription_metrics
-ORDER BY year_month DESC
-LIMIT 3;
+SELECT ym, total_active, monthly_revenue FROM mart_subscription_metrics ORDER BY ym DESC LIMIT 5;
